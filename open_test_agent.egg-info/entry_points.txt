@@ -1,0 +1,2 @@
+[console_scripts]
+open-test = open_test_agent.main:main

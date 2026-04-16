@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-test-agent"
+version = "0.1.0"
+description = "本地工作流执行 CLI — open-test-agent"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13",
+    "httpx>=0.27",
+    "jsonpath-ng>=1.6",
+    "fastapi>=0.111",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+android = [
+    "uiautomator2>=3.2",
+]
+
+[project.scripts]
+open-test = "open_test_agent.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["open_test_agent*"]

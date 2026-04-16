@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: open-test-agent
+Version: 0.1.0
+Summary: 本地工作流执行 CLI — open-test-agent
+Requires-Python: >=3.11
+Requires-Dist: click>=8.1
+Requires-Dist: rich>=13
+Requires-Dist: httpx>=0.27
+Requires-Dist: jsonpath-ng>=1.6
+Provides-Extra: android
+Requires-Dist: uiautomator2>=3.2; extra == "android"

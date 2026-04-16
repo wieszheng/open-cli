@@ -1,0 +1,7 @@
+click>=8.1
+rich>=13
+httpx>=0.27
+jsonpath-ng>=1.6
+
+[android]
+uiautomator2>=3.2

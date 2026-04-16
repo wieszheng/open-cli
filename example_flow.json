@@ -1,0 +1,79 @@
+{
+  "nodes": [
+    {
+      "id": "step_1",
+      "type": "httpRequest",
+      "position": {"x": 100, "y": 100},
+      "data": {
+        "label": "获取用户列表",
+        "method": "GET",
+        "url": "https://jsonplaceholder.typicode.com/users",
+        "headers": "",
+        "body": "",
+        "timeout": 10000
+      }
+    },
+    {
+      "id": "step_2",
+      "type": "assertion",
+      "position": {"x": 350, "y": 100},
+      "data": {
+        "label": "验证状态码 200",
+        "assertType": "status_code",
+        "expression": "response.status",
+        "expected": "200"
+      }
+    },
+    {
+      "id": "step_3",
+      "type": "extract",
+      "position": {"x": 600, "y": 100},
+      "data": {
+        "label": "提取第一个用户ID",
+        "source": "json_path",
+        "expression": "$[0].id",
+        "varName": "user_id"
+      }
+    },
+    {
+      "id": "step_4",
+      "type": "httpRequest",
+      "position": {"x": 850, "y": 100},
+      "data": {
+        "label": "获取用户详情",
+        "method": "GET",
+        "url": "https://jsonplaceholder.typicode.com/users/{{user_id}}",
+        "headers": "",
+        "body": "",
+        "timeout": 10000
+      }
+    },
+    {
+      "id": "step_5",
+      "type": "assertion",
+      "position": {"x": 1100, "y": 100},
+      "data": {
+        "label": "验证响应包含用户名",
+        "assertType": "contains",
+        "expression": "response.body",
+        "expected": "\"username\""
+      }
+    },
+    {
+      "id": "step_6",
+      "type": "wait",
+      "position": {"x": 1100, "y": 220},
+      "data": {
+        "label": "等待 0.5 秒",
+        "seconds": 0.5
+      }
+    }
+  ],
+  "edges": [
+    {"id": "e1-2", "source": "step_1", "target": "step_2"},
+    {"id": "e2-3", "source": "step_2", "target": "step_3"},
+    {"id": "e3-4", "source": "step_3", "target": "step_4"},
+    {"id": "e4-5", "source": "step_4", "target": "step_5"},
+    {"id": "e5-6", "source": "step_5", "target": "step_6"}
+  ]
+}
