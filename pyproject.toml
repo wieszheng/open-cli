@@ -18,7 +18,14 @@ dependencies = [
 
 [project.optional-dependencies]
 android = [
-    "uiautomator2>=3.2",
+    "adbutils>=2.6",
+]
+harmony = [
+    # hdc 命令行工具随 DevEco Studio / OpenHarmony SDK 安装，无 PyPI 包
+    # 确保 hdc 在 PATH 中：which hdc
+]
+all-devices = [
+    "adbutils>=2.6",
 ]
 
 [project.scripts]

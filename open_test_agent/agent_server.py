@@ -1,15 +1,20 @@
 """
 本地 Agent HTTP 服务器
-监听 localhost:7357，执行需要本地设备的节点（appUiAction / ADB）
+监听 localhost:7357，执行需要本地设备的节点（App UI 操作 / ADB / HDC）
+
+device_type 字段决定使用哪个驱动：
+  - "android"（默认）→ adb.py（adbutils）
+  - "harmony"         → hdc.py（hdc CLI + uitest）
 """
 import asyncio
+import base64
 import json
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -51,6 +56,7 @@ class ExecuteResponse(BaseModel):
     success: bool
     message: str
     duration: float   # seconds
+    screenshot: str | None = None  # base64 PNG，无截图时为 null
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +66,15 @@ class ExecuteResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from open_test_agent.drivers.adb import check_adb
-    devices = check_adb()
-    _log("info", None, f"Agent 启动，已连接设备: {', '.join(devices) if devices else '无'}")
+    from open_test_agent.drivers.hdc import check_hdc
+    android_devices = check_adb()
+    harmony_devices = check_hdc()
+    parts = []
+    if android_devices:
+        parts.append(f"Android: {', '.join(android_devices)}")
+    if harmony_devices:
+        parts.append(f"HarmonyOS: {', '.join(harmony_devices)}")
+    _log("info", None, f"Agent 启动，已连接设备: {'; '.join(parts) if parts else '无'}")
     yield
 
 
@@ -82,15 +95,50 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     from open_test_agent.drivers.adb import check_adb
-    devices = check_adb()
-    return {"status": "ok", "devices": devices}
+    from open_test_agent.drivers.hdc import check_hdc
+    return {
+        "status": "ok",
+        "devices": {
+            "android": check_adb(),
+            "harmony": check_hdc(),
+        }
+    }
+
+
+@app.get("/screenshot")
+async def screenshot(serial: str | None = Query(None), device_type: str = Query("android")):
+    """截取当前设备屏幕，返回 base64 PNG + 分辨率。device_type: android | harmony"""
+    try:
+        if device_type == "harmony":
+            from open_test_agent.drivers.hdc import capture_screenshot
+        else:
+            from open_test_agent.drivers.adb import capture_screenshot
+        img_bytes, width, height = await capture_screenshot(serial or None)
+        b64 = base64.b64encode(img_bytes).decode()
+        return {
+            "image": f"data:image/png;base64,{b64}",
+            "width": width,
+            "height": height,
+        }
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# App UI 操作节点类型集合（与前端 nodes.tsx 中 APP_UI_NODE_TYPES 保持一致）
+_APP_UI_NODE_TYPES = {
+    "appUiAction",       # 旧类型，向后兼容
+    "appLaunchApp", "appClick", "appLongPress", "appDoubleClick",
+    "appType", "appClearText", "appSwipe", "appTapXy",
+    "appWaitElement", "appGetText", "appScreenshot", "appPressKey",
+}
 
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_node(body: ExecuteRequest):
     """执行单个节点，返回执行结果。"""
     t0 = time.perf_counter()
-    node_type = body.node_data.get("_node_type", "appUiAction")
+    node_type = body.node_data.get("_node_type", "appLaunchApp")
     action = body.node_data.get("action", "")
     label = body.node_data.get("label", body.node_id)
 
@@ -98,13 +146,22 @@ async def execute_node(body: ExecuteRequest):
          {"action": action, "node_type": node_type})
 
     try:
-        if node_type == "appUiAction":
-            from open_test_agent.drivers.adb import run_app_ui_action
-            success, message = await run_app_ui_action(body.node_data)
+        if node_type in _APP_UI_NODE_TYPES:
+            device_type = body.node_data.get("device_type", "android")
+            if device_type == "harmony":
+                from open_test_agent.drivers.hdc import run_app_ui_action
+            else:
+                from open_test_agent.drivers.adb import run_app_ui_action
+            success, message, shot_bytes = await run_app_ui_action(body.node_data)
         else:
-            success, message = False, f"Agent 不支持的节点类型: {node_type}"
+            success, message, shot_bytes = False, f"Agent 不支持的节点类型: {node_type}", None
     except Exception as exc:
-        success, message = False, str(exc)
+        success, message, shot_bytes = False, str(exc), None
+
+    screenshot: str | None = None
+    if shot_bytes:
+        import base64 as _b64
+        screenshot = "data:image/png;base64," + _b64.b64encode(shot_bytes).decode()
 
     duration = time.perf_counter() - t0
     level = "success" if success else "error"
@@ -112,7 +169,7 @@ async def execute_node(body: ExecuteRequest):
     _log(level, body.node_id, f"{icon} {message}  ({duration*1000:.0f}ms)",
          {"success": success, "duration_ms": round(duration * 1000)})
 
-    return ExecuteResponse(success=success, message=message, duration=duration)
+    return ExecuteResponse(success=success, message=message, duration=duration, screenshot=screenshot)
 
 
 @app.get("/logs")

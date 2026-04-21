@@ -7,5 +7,10 @@ Requires-Dist: click>=8.1
 Requires-Dist: rich>=13
 Requires-Dist: httpx>=0.27
 Requires-Dist: jsonpath-ng>=1.6
+Requires-Dist: fastapi>=0.111
+Requires-Dist: uvicorn>=0.29
 Provides-Extra: android
-Requires-Dist: uiautomator2>=3.2; extra == "android"
+Requires-Dist: adbutils>=2.6; extra == "android"
+Provides-Extra: harmony
+Provides-Extra: all-devices
+Requires-Dist: adbutils>=2.6; extra == "all-devices"
