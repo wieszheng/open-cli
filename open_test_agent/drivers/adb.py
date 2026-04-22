@@ -4,6 +4,10 @@ ADB 驱动（基于 adbutils）
 
 STUB 模式：所有操作均模拟执行（固定成功 + 随机延迟），无需真机。
 真实模式：依赖 adbutils，通过 ADB 协议直接与设备通信，无需在设备上安装额外服务。
+
+接口分层：
+  run_app_ui_action(data)          — 旧接口，自含定位+动作，向后兼容
+  run_action_at(action, coords, data, serial) — 新接口，坐标已由 locator 层计算
 """
 import asyncio
 import subprocess
@@ -54,6 +58,185 @@ async def run_app_ui_action(data: dict) -> tuple[bool, str, bytes | None]:
     return ok, msg, shot
 
 
+# ── 新接口：动作执行（坐标由外部 locator 传入） ───────────────────────────────
+
+async def run_action_at(
+    action: str,
+    coords: tuple[int, int] | None,
+    data: dict,
+    serial: str | None,
+) -> tuple[bool, str]:
+    """
+    执行动作，坐标由混合定位层（locator.py）预先计算并传入。
+    coords=None 表示该动作不需要元素坐标（如 launch_app / swipe / press_key）。
+    返回 (success, message)，不含截图（由 agent_server 统一处理）。
+    """
+    if STUB:
+        return await _stub_action(data)
+    try:
+        import adbutils  # noqa: F401
+    except ImportError:
+        return False, "adbutils 未安装，请执行: pip install adbutils"
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(None, _execute_at, action, coords, data, serial),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        return False, f"操作超时（60s）: {action}"
+    return ok, msg
+
+
+def _execute_at(
+    action: str,
+    coords: tuple[int, int] | None,
+    data: dict,
+    serial: str | None,
+) -> tuple[bool, str]:
+    """
+    同步动作执行器。coords 为已经计算好的中心坐标，None 表示无需定位。
+    与旧 _execute() 共存，不含自行定位逻辑。
+    """
+    import time
+
+    try:
+        d = _get_device(serial)
+        x, y = coords if coords is not None else (0, 0)
+
+        # ── launch_app ────────────────────────────────────────────────────
+        if action == "launch_app":
+            app_id = data.get("app_id", "")
+            launch_type = data.get("launch_type", "cold")
+            if not app_id:
+                return False, "app_id 不能为空"
+            if launch_type == "cold":
+                try:
+                    d.app_stop(app_id)
+                except Exception:
+                    pass
+            d.app_start(app_id)
+            return True, f"已{'冷' if launch_type == 'cold' else '热'}启动 {app_id}"
+
+        # ── tap_xy ────────────────────────────────────────────────────────
+        if action == "tap_xy":
+            coords_str = data.get("coordinates", "")
+            if coords_str and "," in coords_str:
+                try:
+                    tx, ty = [int(v.strip()) for v in coords_str.split(",", 1)]
+                    d.click(tx, ty)
+                    return True, f"tapped ({tx}, {ty})"
+                except ValueError:
+                    return False, f"坐标解析失败: {coords_str!r}"
+            return False, "coordinates 格式错误，应为 x,y"
+
+        # ── swipe ─────────────────────────────────────────────────────────
+        if action == "swipe":
+            direction = data.get("value", "up")
+            w, h = d.window_size()
+            cx_s, cy_s = w // 2, h // 2
+            coords_map = {
+                "up":    (cx_s, int(h * 0.7), cx_s, int(h * 0.3)),
+                "down":  (cx_s, int(h * 0.3), cx_s, int(h * 0.7)),
+                "left":  (int(w * 0.7), cy_s, int(w * 0.3), cy_s),
+                "right": (int(w * 0.3), cy_s, int(w * 0.7), cy_s),
+            }
+            x1, y1, x2, y2 = coords_map.get(direction, coords_map["up"])
+            d.swipe(x1, y1, x2, y2, duration=0.4)
+            return True, f"swiped {direction}"
+
+        # ── screenshot ────────────────────────────────────────────────────
+        if action == "screenshot":
+            import io
+            path = f"/tmp/screenshot_{int(time.time())}.png"
+            img = d.screenshot()
+            img.save(path)
+            return True, f"screenshot saved: {path}"
+
+        # ── press_key ─────────────────────────────────────────────────────
+        if action == "press_key":
+            key_map = {
+                "home": "HOME", "back": "BACK", "recent": "APP_SWITCH",
+                "volume_up": "VOLUME_UP", "volume_down": "VOLUME_DOWN",
+                "power": "POWER", "enter": "ENTER",
+            }
+            key = data.get("key_code", "home")
+            d.keyevent(key_map.get(key, key.upper()))
+            return True, f"pressed key: {key}"
+
+        # ── coords 必须有效才能继续 ───────────────────────────────────────
+        if coords is None:
+            return False, f"动作 {action!r} 需要元素坐标，但 locator 未提供"
+
+        # ── click ─────────────────────────────────────────────────────────
+        if action == "click":
+            d.click(x, y)
+            return True, f"clicked ({x},{y})"
+
+        # ── double_click ──────────────────────────────────────────────────
+        if action == "double_click":
+            d.click(x, y)
+            time.sleep(0.08)
+            d.click(x, y)
+            return True, f"double_clicked ({x},{y})"
+
+        # ── long_press ────────────────────────────────────────────────────
+        if action == "long_press":
+            ms = int(data.get("duration_ms", 1000))
+            d.swipe(x, y, x, y, duration=ms / 1000.0)
+            return True, f"long_pressed ({x},{y}) for {ms}ms"
+
+        # ── type ──────────────────────────────────────────────────────────
+        if action == "type":
+            value = data.get("value", "")
+            d.click(x, y)
+            time.sleep(0.2)
+            d.send_keys(value)
+            return True, f"typed {value!r} into ({x},{y})"
+
+        # ── clear_text ────────────────────────────────────────────────────
+        if action == "clear_text":
+            d.click(x, y)
+            time.sleep(0.2)
+            d.keyevent(277)   # KEYCODE_CTRL_A
+            time.sleep(0.1)
+            d.keyevent(67)    # KEYCODE_DEL
+            return True, f"cleared text at ({x},{y})"
+
+        # ── wait_element ──────────────────────────────────────────────────
+        # 此动作依赖 locator 层重试，到达这里说明已定位成功
+        if action == "wait_element":
+            return True, f"element appeared at ({x},{y})"
+
+        # ── get_text ──────────────────────────────────────────────────────
+        if action == "get_text":
+            import xml.etree.ElementTree as ET
+            import re
+            var_name = data.get("var_name", "result")
+            # 若 locator 为 OCR 策略，found_text 由 agent_server 层注入在 data["_ocr_text"]
+            ocr_text = data.get("_ocr_text")
+            if ocr_text is not None:
+                return True, f"{var_name} = {ocr_text!r}"
+            # 否则从 XML 层级树按坐标反查
+            xml_str = d.dump_hierarchy()
+            root = ET.fromstring(xml_str)
+            pat = re.compile(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]')
+            for elem in root.iter():
+                m = pat.match(elem.get("bounds", ""))
+                if m:
+                    x1e, y1e, x2e, y2e = map(int, m.groups())
+                    if (x1e + x2e) // 2 == x and (y1e + y2e) // 2 == y:
+                        text = elem.get("text", "")
+                        return True, f"{var_name} = {text!r}"
+            return True, f"{var_name} = ''"
+
+        return False, f"不支持的 action: {action}"
+
+    except Exception as exc:
+        return False, str(exc)
+
+
 # ── 截图 API ──────────────────────────────────────────────────────────────────
 
 async def capture_screenshot(serial: str | None = None) -> tuple[bytes, int, int]:
@@ -74,6 +257,29 @@ def _capture_screenshot_sync(serial: str | None) -> tuple[bytes, int, int]:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue(), w, h
+
+
+def _dump_hierarchy(serial: str | None) -> dict:
+    """
+    获取 Android UI 层级树，解析 XML 并转为嵌套 dict 供 agent_server /layout 使用。
+    返回根节点 dict，子节点在 "node" 列表中。
+    """
+    import xml.etree.ElementTree as ET
+
+    d = _get_device(serial)
+    xml_str = d.dump_hierarchy()
+    root = ET.fromstring(xml_str)
+
+    def _to_dict(elem) -> dict:
+        node: dict = {k: v for k, v in elem.attrib.items() if k.startswith("@") or True}
+        # attrib keys 本身已是 @resource-id / @text / @bounds 等
+        node.update({f"@{k}": v for k, v in elem.attrib.items()})
+        children = [_to_dict(child) for child in elem]
+        if children:
+            node["node"] = children
+        return node
+
+    return _to_dict(root)
 
 
 # ── 真实执行 ──────────────────────────────────────────────────────────────────
@@ -161,8 +367,14 @@ def _execute(action: str, data: dict, serial: str | None) -> tuple[bool, str]:
             app_id = data.get("app_id", "")
             if not app_id:
                 return False, "app_id 不能为空"
+            launch_type = data.get("launch_type", "cold")
+            if launch_type == "cold":
+                try:
+                    d.app_stop(app_id)
+                except Exception:
+                    pass
             d.app_start(app_id)
-            return True, f"已启动 {app_id}"
+            return True, f"已{'冷' if launch_type == 'cold' else '热'}启动 {app_id}"
 
         # ── tap_xy ────────────────────────────────────────────────────────
         if action == "tap_xy":

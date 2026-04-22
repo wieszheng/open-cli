@@ -3,16 +3,22 @@ HDC 驱动（鸿蒙设备，基于 hdc 命令行）
 封装 appUiAction 节点的实际执行逻辑
 
 依赖：hdc 命令行工具（随 DevEco Studio / OpenHarmony SDK 安装）
-  - 触控注入：uitest uiInput click/swipe/longClick/doubleClick/keyEvent/inputText
-  - 截图：     uitest screenCap + hdc file recv
+  - 触控注入：uitest uiInput click/swipe/fling/longClick/doubleClick/drag/keyEvent/inputText
+  - 截图：     snapshot_display -f（推荐，性能远优于 uitest screenCap）
   - 布局树：   uitest dumpLayout + hdc file recv
-  - 应用启动： aa start -b <bundleName> -a <abilityName>
+  - 应用启动： aa start -a <abilityName> -b <bundleName>
+  - 应用退出： aa force-stop <bundleName>
+
+接口分层：
+  run_app_ui_action(data)                     — 旧接口，自含定位+动作，向后兼容
+  run_action_at(action, coords, data, serial) — 新接口，坐标已由 locator 层计算
 """
 import asyncio
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -100,32 +106,257 @@ async def run_app_ui_action(data: dict) -> tuple[bool, str, bytes | None]:
     return ok, msg, shot
 
 
+# ── 新接口：动作执行（坐标由外部 locator 传入） ───────────────────────────────
+
+async def run_action_at(
+    action: str,
+    coords: tuple[int, int] | None,
+    data: dict,
+    serial: str | None,
+) -> tuple[bool, str]:
+    """
+    执行动作，坐标由混合定位层（locator.py）预先计算并传入。
+    coords=None 表示该动作不需要元素坐标（如 launch_app / swipe / press_key）。
+    返回 (success, message)，不含截图。
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(None, _execute_at, action, coords, data, serial),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        return False, f"操作超时（60s）: {action}"
+    return ok, msg
+
+
+def _execute_at(
+    action: str,
+    coords: tuple[int, int] | None,
+    data: dict,
+    serial: str | None,
+) -> tuple[bool, str]:
+    """
+    HDC 同步动作执行器。coords 为已经计算好的中心坐标，None 表示无需定位。
+    """
+    try:
+        x, y = coords if coords is not None else (0, 0)
+
+        # ── launch_app ────────────────────────────────────────────────────
+        if action == "launch_app":
+            app_id = data.get("app_id", "")
+            if not app_id:
+                return False, "app_id 不能为空"
+            bundle, ability = (app_id.split("/", 1) if "/" in app_id
+                               else (app_id, "EntryAbility"))
+            launch_type = data.get("launch_type", "cold")
+            if launch_type == "cold":
+                # 冷起：先强制关闭再启动
+                try:
+                    _shell(f"aa force-stop {bundle}", serial=serial)
+                except Exception:
+                    pass
+            # hdc.md: aa start -a {abilityName} -b {bundleName}
+            _shell(f"aa start -a {ability} -b {bundle}", serial=serial)
+            return True, f"已{'冷' if launch_type == 'cold' else '热'}启动 {app_id}"
+
+        # ── stop_app ──────────────────────────────────────────────────────
+        if action == "stop_app":
+            app_id = data.get("app_id", "")
+            if not app_id:
+                return False, "app_id 不能为空"
+            bundle = app_id.split("/", 1)[0]
+            _shell(f"aa force-stop {bundle}", serial=serial)
+            return True, f"已退出 {bundle}"
+
+        # ── tap_xy ────────────────────────────────────────────────────────
+        if action == "tap_xy":
+            coords_str = data.get("coordinates", "")
+            if coords_str and "," in coords_str:
+                try:
+                    tx, ty = [int(v.strip()) for v in coords_str.split(",", 1)]
+                    _shell(f"uitest uiInput click {tx} {ty}", serial=serial)
+                    return True, f"tapped ({tx}, {ty})"
+                except ValueError:
+                    return False, f"坐标解析失败: {coords_str!r}"
+            return False, "coordinates 格式错误，应为 x,y"
+
+        # ── swipe ─────────────────────────────────────────────────────────
+        if action == "swipe":
+            direction = data.get("value", "up")
+            speed = int(data.get("speed", 600))  # px/s，范围 200-40000
+            fast = data.get("fast", False)        # True 使用 fling（快滑），False 使用 swipe（慢滑）
+            try:
+                layout = _dump_layout(serial)
+                bounds = layout.get("attributes", {}).get("bounds", "[0,0][1080,2340]")
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+                w, h = (int(m.group(3)), int(m.group(4))) if m else (1080, 2340)
+            except Exception:
+                w, h = 1080, 2340
+            cx_s, cy_s = w // 2, h // 2
+            coords_map = {
+                "up":    (cx_s, int(h * 0.7), cx_s, int(h * 0.3)),
+                "down":  (cx_s, int(h * 0.3), cx_s, int(h * 0.7)),
+                "left":  (int(w * 0.7), cy_s, int(w * 0.3), cy_s),
+                "right": (int(w * 0.3), cy_s, int(w * 0.7), cy_s),
+            }
+            x1, y1, x2, y2 = coords_map.get(direction, coords_map["up"])
+            cmd = "fling" if fast else "swipe"
+            _shell(f"uitest uiInput {cmd} {x1} {y1} {x2} {y2} {speed}", serial=serial)
+            return True, f"{cmd}d {direction}"
+
+        # ── fling（快滑，按坐标）─────────────────────────────────────────
+        if action == "fling":
+            fx1 = int(data.get("from_x", 0))
+            fy1 = int(data.get("from_y", 0))
+            fx2 = int(data.get("to_x", 0))
+            fy2 = int(data.get("to_y", 0))
+            speed = int(data.get("speed", 600))
+            _shell(f"uitest uiInput fling {fx1} {fy1} {fx2} {fy2} {speed}", serial=serial)
+            return True, f"flung ({fx1},{fy1}) → ({fx2},{fy2})"
+
+        # ── drag ──────────────────────────────────────────────────────────
+        if action == "drag":
+            dx1 = int(data.get("from_x", x))
+            dy1 = int(data.get("from_y", y))
+            dx2 = int(data.get("to_x", 0))
+            dy2 = int(data.get("to_y", 0))
+            speed = int(data.get("speed", 600))
+            _shell(f"uitest uiInput drag {dx1} {dy1} {dx2} {dy2} {speed}", serial=serial)
+            return True, f"dragged ({dx1},{dy1}) → ({dx2},{dy2})"
+
+        # ── screenshot ────────────────────────────────────────────────────
+        if action == "screenshot":
+            # 使用 snapshot_display（性能远优于 uitest screenCap）
+            remote = "/data/local/tmp/_agent_shot.jpeg"
+            _shell(f"snapshot_display -f {remote}", serial=serial)
+            local = f"/tmp/screenshot_{int(time.time())}.jpeg"
+            _run(["file", "recv", remote, local], serial=serial)
+            return True, f"screenshot saved: {local}"
+
+        # ── press_key ─────────────────────────────────────────────────────
+        if action == "press_key":
+            key = data.get("key_code", "home")
+            key_arg = _KEY_MAP.get(key, key)
+            _shell(f"uitest uiInput keyEvent {key_arg}", serial=serial)
+            return True, f"pressed key: {key}"
+
+        # ── coords 必须有效才能继续 ───────────────────────────────────────
+        if coords is None:
+            return False, f"动作 {action!r} 需要元素坐标，但 locator 未提供"
+
+        # ── click ─────────────────────────────────────────────────────────
+        if action == "click":
+            _shell(f"uitest uiInput click {x} {y}", serial=serial)
+            return True, f"clicked ({x},{y})"
+
+        # ── double_click ──────────────────────────────────────────────────
+        if action == "double_click":
+            _shell(f"uitest uiInput doubleClick {x} {y}", serial=serial)
+            return True, f"double_clicked ({x},{y})"
+
+        # ── long_press ────────────────────────────────────────────────────
+        if action == "long_press":
+            _shell(f"uitest uiInput longClick {x} {y}", serial=serial)
+            return True, f"long_pressed ({x},{y})"
+
+        # ── type ──────────────────────────────────────────────────────────
+        if action == "type":
+            value = data.get("value", "")
+            _shell(f"uitest uiInput inputText {x} {y} {value}", serial=serial)
+            return True, f"typed {value!r} into ({x},{y})"
+
+        # ── clear_text ────────────────────────────────────────────────────
+        if action == "clear_text":
+            _shell(f"uitest uiInput click {x} {y}", serial=serial)
+            time.sleep(0.2)
+            _shell("uitest uiInput keyEvent 2072 2038", serial=serial)  # Ctrl+A（全选）
+            time.sleep(0.1)
+            _shell("uitest uiInput keyEvent 2055", serial=serial)        # Delete
+            return True, f"cleared text at ({x},{y})"
+
+        # ── wait_element ──────────────────────────────────────────────────
+        if action == "wait_element":
+            return True, f"element appeared at ({x},{y})"
+
+        # ── get_text ──────────────────────────────────────────────────────
+        if action == "get_text":
+            var_name = data.get("var_name", "result")
+            ocr_text = data.get("_ocr_text")
+            if ocr_text is not None:
+                return True, f"{var_name} = {ocr_text!r}"
+            layout = _dump_layout(serial)
+
+            def _walk_text(node: dict) -> str | None:
+                bounds = node.get("attributes", {}).get("bounds", "")
+                m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+                if m:
+                    x1e, y1e, x2e, y2e = map(int, m.groups())
+                    if (x1e + x2e) // 2 == x and (y1e + y2e) // 2 == y:
+                        return node.get("attributes", {}).get("text", "")
+                for child in node.get("children", []):
+                    t = _walk_text(child)
+                    if t is not None:
+                        return t
+                return None
+
+            text = _walk_text(layout) or ""
+            return True, f"{var_name} = {text!r}"
+
+        return False, f"不支持的 action: {action}"
+
+    except Exception as exc:
+        return False, str(exc)
+
+
 # ── 截图 API ──────────────────────────────────────────────────────────────────
 
 async def capture_screenshot(serial: str | None = None) -> tuple[bytes, int, int]:
-    """返回 (png_bytes, device_width, device_height)。"""
+    """返回 (img_bytes, device_width, device_height)。"""
     return await asyncio.get_event_loop().run_in_executor(
         None, _capture_screenshot_sync, serial
     )
 
 
 def _capture_screenshot_sync(serial: str | None) -> tuple[bytes, int, int]:
-    remote = "/data/local/tmp/_agent_shot.png"
-    _shell(f"uitest screenCap -p {remote}", serial=serial)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+    """
+    使用 snapshot_display 截图（性能远优于 uitest screenCap）。
+    返回 (jpeg_bytes, width, height)；宽高从设备屏幕信息获取。
+    """
+    remote = "/data/local/tmp/_agent_shot.jpeg"
+    # 【推荐】hdc.md 方式二：snapshot_display -f，性能远优于 uitest screenCap
+    _shell(f"snapshot_display -f {remote}", serial=serial)
+    with tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False) as f:
         local = f.name
     try:
         _run(["file", "recv", remote, local], serial=serial)
         with open(local, "rb") as f:
-            png_bytes = f.read()
+            img_bytes = f.read()
     finally:
         os.unlink(local)
 
-    # 从 PNG IHDR 块读取宽高（偏移 16-23 字节）
-    import struct
-    w = struct.unpack(">I", png_bytes[16:20])[0]
-    h = struct.unpack(">I", png_bytes[20:24])[0]
-    return png_bytes, w, h
+    # 从 JPEG SOF0/SOF2 标记解析宽高
+    w, h = _parse_jpeg_size(img_bytes)
+    return img_bytes, w, h
+
+
+def _parse_jpeg_size(data: bytes) -> tuple[int, int]:
+    """从 JPEG 字节流解析图片宽高，解析失败返回 (0, 0)。"""
+    try:
+        i = 2  # 跳过 SOI (FF D8)
+        while i < len(data) - 1:
+            if data[i] != 0xFF:
+                break
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2):  # SOF0 / SOF1 / SOF2
+                h = struct.unpack(">H", data[i + 5:i + 7])[0]
+                w = struct.unpack(">H", data[i + 7:i + 9])[0]
+                return w, h
+            length = struct.unpack(">H", data[i + 2:i + 4])[0]
+            i += 2 + length
+    except Exception:
+        pass
+    return 0, 0
 
 
 # ── 布局树查找 ────────────────────────────────────────────────────────────────
@@ -193,6 +424,7 @@ def _find_element(serial: str | None, selector: str) -> tuple[int, int]:
 
 
 # ── 按键映射 ──────────────────────────────────────────────────────────────────
+# 参考：https://docs.openharmony.cn/pages/v4.1/en/application-dev/reference/apis-input-kit/js-apis-keycode.md
 
 _KEY_MAP = {
     "home":        "Home",
@@ -202,6 +434,9 @@ _KEY_MAP = {
     "volume_down": "17",    # KEYCODE_VOLUME_DOWN
     "power":       "18",    # KEYCODE_POWER
     "enter":       "23",    # KEYCODE_ENTER
+    "delete":      "2055",  # KEYCODE_DEL
+    "space":       "2062",  # KEYCODE_SPACE
+    "tab":         "2049",  # KEYCODE_TAB
 }
 
 
@@ -215,12 +450,27 @@ def _execute(action: str, data: dict, serial: str | None) -> tuple[bool, str]:
             if not app_id:
                 return False, "app_id 不能为空"
             # 支持 bundleName 或 bundleName/abilityName 两种格式
-            if "/" in app_id:
-                bundle, ability = app_id.split("/", 1)
-            else:
-                bundle, ability = app_id, "MainAbility"
-            _shell(f"aa start -b {bundle} -a {ability}", serial=serial)
-            return True, f"已启动 {app_id}"
+            bundle, ability = (app_id.split("/", 1) if "/" in app_id
+                               else (app_id, "EntryAbility"))
+            launch_type = data.get("launch_type", "cold")
+            if launch_type == "cold":
+                # 冷起：先强制关闭再启动
+                try:
+                    _shell(f"aa force-stop {bundle}", serial=serial)
+                except Exception:
+                    pass
+            # hdc.md: aa start -a {abilityName} -b {bundleName}
+            _shell(f"aa start -a {ability} -b {bundle}", serial=serial)
+            return True, f"已{'冷' if launch_type == 'cold' else '热'}启动 {app_id}"
+
+        # ── stop_app ──────────────────────────────────────────────────────
+        if action == "stop_app":
+            app_id = data.get("app_id", "")
+            if not app_id:
+                return False, "app_id 不能为空"
+            bundle = app_id.split("/", 1)[0]
+            _shell(f"aa force-stop {bundle}", serial=serial)
+            return True, f"已退出 {bundle}"
 
         # ── tap_xy ────────────────────────────────────────────────────────
         if action == "tap_xy":
@@ -231,13 +481,14 @@ def _execute(action: str, data: dict, serial: str | None) -> tuple[bool, str]:
                 x, y = [int(v.strip()) for v in coords.split(",", 1)]
             except ValueError:
                 return False, f"坐标解析失败: {coords!r}"
-            out = _shell(f"uitest uiInput click {x} {y}", serial=serial)
+            _shell(f"uitest uiInput click {x} {y}", serial=serial)
             return True, f"tapped ({x}, {y})"
 
         # ── swipe ─────────────────────────────────────────────────────────
         if action == "swipe":
             direction = data.get("value", "up")
-            # 获取屏幕尺寸（从 layout 根节点 bounds）
+            speed = int(data.get("speed", 600))   # px/s，范围 200-40000
+            fast = data.get("fast", False)         # True → fling（快滑），False → swipe（慢滑）
             try:
                 layout = _dump_layout(serial)
                 bounds = layout.get("attributes", {}).get("bounds", "[0,0][1080,2340]")
@@ -256,14 +507,36 @@ def _execute(action: str, data: dict, serial: str | None) -> tuple[bool, str]:
                 "right": (int(w * 0.3), cy, int(w * 0.7), cy),
             }
             x1, y1, x2, y2 = coords_map.get(direction, coords_map["up"])
-            _shell(f"uitest uiInput swipe {x1} {y1} {x2} {y2} 600", serial=serial)
-            return True, f"swiped {direction}"
+            cmd = "fling" if fast else "swipe"
+            _shell(f"uitest uiInput {cmd} {x1} {y1} {x2} {y2} {speed}", serial=serial)
+            return True, f"{cmd}d {direction}"
+
+        # ── fling（快滑，按坐标）─────────────────────────────────────────
+        if action == "fling":
+            fx1 = int(data.get("from_x", 0))
+            fy1 = int(data.get("from_y", 0))
+            fx2 = int(data.get("to_x", 0))
+            fy2 = int(data.get("to_y", 0))
+            speed = int(data.get("speed", 600))
+            _shell(f"uitest uiInput fling {fx1} {fy1} {fx2} {fy2} {speed}", serial=serial)
+            return True, f"flung ({fx1},{fy1}) → ({fx2},{fy2})"
+
+        # ── drag ──────────────────────────────────────────────────────────
+        if action == "drag":
+            dx1 = int(data.get("from_x", 0))
+            dy1 = int(data.get("from_y", 0))
+            dx2 = int(data.get("to_x", 0))
+            dy2 = int(data.get("to_y", 0))
+            speed = int(data.get("speed", 600))
+            _shell(f"uitest uiInput drag {dx1} {dy1} {dx2} {dy2} {speed}", serial=serial)
+            return True, f"dragged ({dx1},{dy1}) → ({dx2},{dy2})"
 
         # ── screenshot ────────────────────────────────────────────────────
         if action == "screenshot":
-            remote = "/data/local/tmp/_agent_shot.png"
-            _shell(f"uitest screenCap -p {remote}", serial=serial)
-            local = f"/tmp/screenshot_{int(time.time())}.png"
+            # 使用 snapshot_display（性能远优于 uitest screenCap）
+            remote = "/data/local/tmp/_agent_shot.jpeg"
+            _shell(f"snapshot_display -f {remote}", serial=serial)
+            local = f"/tmp/screenshot_{int(time.time())}.jpeg"
             _run(["file", "recv", remote, local], serial=serial)
             return True, f"screenshot saved: {local}"
 
@@ -306,9 +579,9 @@ def _execute(action: str, data: dict, serial: str | None) -> tuple[bool, str]:
             # 先点击聚焦，再全选删除
             _shell(f"uitest uiInput click {x} {y}", serial=serial)
             time.sleep(0.2)
-            _shell("uitest uiInput keyEvent 2072 2", serial=serial)   # Ctrl+A
+            _shell("uitest uiInput keyEvent 2072 2038", serial=serial)  # Ctrl+A（全选）
             time.sleep(0.1)
-            _shell("uitest uiInput keyEvent 2055", serial=serial)      # Delete
+            _shell("uitest uiInput keyEvent 2055", serial=serial)        # Delete
             return True, f"cleared text in {selector}"
 
         if action == "wait_element":

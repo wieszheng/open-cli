@@ -4,6 +4,7 @@ open_test_agent/__init__.py
 open_test_agent/agent_server.py
 open_test_agent/executor.py
 open_test_agent/install.py
+open_test_agent/locator.py
 open_test_agent/main.py
 open_test_agent.egg-info/PKG-INFO
 open_test_agent.egg-info/SOURCES.txt
