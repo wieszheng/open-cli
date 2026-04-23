@@ -12,5 +12,8 @@ Requires-Dist: uvicorn>=0.29
 Provides-Extra: android
 Requires-Dist: adbutils>=2.6; extra == "android"
 Provides-Extra: harmony
+Provides-Extra: ocr
+Requires-Dist: rapidocr>=1.0; extra == "ocr"
+Requires-Dist: onnxruntime>=1.16; extra == "ocr"
 Provides-Extra: all-devices
 Requires-Dist: adbutils>=2.6; extra == "all-devices"

@@ -145,22 +145,51 @@ async def layout(serial: str | None = Query(None), device_type: str = Query("and
         elements: list[dict] = []
 
         if device_type == "harmony":
-            import asyncio as _asyncio, re as _re
+            import asyncio as _asyncio
+
+            _SKIP_TYPES = {
+                "WindowScene", "metaballNode", "BuilderProxyNode", "root",
+            }
+            _CONTAINER_TYPES = {
+                "__Common__", "__Stack__", "Stack", "Column",
+                "Row", "Flex", "RelativeContainer", "genericContainer",
+            }
+
             loop = _asyncio.get_event_loop()
             tree = await loop.run_in_executor(None, _dump_layout, serial or None)
 
             def _walk(node: dict):
                 attrs = node.get("attributes", {})
-                bounds = attrs.get("bounds", "")
-                m = _re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
-                if m:
-                    x1, y1, x2, y2 = map(int, m.groups())
-                    if x2 > x1 and y2 > y1:
-                        node_id   = attrs.get("id") or attrs.get("key") or ""
-                        text      = attrs.get("text") or ""
-                        desc      = attrs.get("description") or ""
-                        node_type = attrs.get("type") or ""
-                        # 计算最优 selector
+                bounds_str = attrs.get("bounds", "")
+                try:
+                    parts = bounds_str.strip("[]").split("][")
+                    x1 = int(parts[0].split(",")[0])
+                    y1 = int(parts[0].split(",")[1])
+                    x2 = int(parts[1].split(",")[0])
+                    y2 = int(parts[1].split(",")[1])
+                except (IndexError, ValueError):
+                    for child in node.get("children", []):
+                        _walk(child)
+                    return
+
+                node_type = (attrs.get("type") or "").strip()
+                node_id   = (attrs.get("id") or "").strip()
+                text      = (attrs.get("text") or "").strip()
+                desc      = (attrs.get("description") or "").strip()
+                clickable = attrs.get("clickable", "").lower() == "true"
+
+                if x2 > x1 and y2 > y1:
+                    add = True
+                    if node_type in _SKIP_TYPES:
+                        add = False
+                    elif y2 <= 140 and y1 < 140:              # 状态栏
+                        add = False
+                    elif y1 < 10 and (x2 - x1) > 400 and (y2 - y1) < 140:  # 灵动岛
+                        add = False
+                    elif node_type in _CONTAINER_TYPES and not text and not node_id and not clickable:
+                        add = False                             # 无内容透明容器
+
+                    if add:
                         if node_id:
                             sel = f"#{node_id}"
                         elif text:
@@ -168,19 +197,23 @@ async def layout(serial: str | None = Query(None), device_type: str = Query("and
                         elif desc:
                             sel = desc
                         elif node_type:
-                            sel = node_type.split(".")[-1]
+                            sel = node_type
                         else:
                             sel = ""
                         elements.append({
                             "id": node_id, "text": text,
-                            "type": node_type.split(".")[-1] if node_type else "",
-                            "description": desc,
+                            "type": node_type, "description": desc,
                             "selector": sel,
                             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         })
+
+                # 始终递归子节点
                 for child in node.get("children", []):
                     _walk(child)
-            _walk(tree)
+
+            # 跳过根节点本身，从第一层子节点开始（与 convert_harmony_hierarchy 一致）
+            for child in tree.get("children", []):
+                _walk(child)
 
         else:
             import asyncio as _asyncio, re as _re
@@ -228,12 +261,11 @@ async def layout(serial: str | None = Query(None), device_type: str = Query("and
         from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(exc))
 
-
 @app.get("/ocr")
 async def ocr_detect(serial: str | None = Query(None), device_type: str = Query("android")):
     """
     截图 + OCR 文字识别，返回 {image, width, height, regions: [{text, x1,y1,x2,y2, confidence}]}
-    依赖：paddleocr（可选，未安装时返回空 regions）
+    依赖：rapidocr-onnxruntime（可选，未安装时返回空 regions）
     """
     try:
         if device_type == "harmony":
@@ -248,36 +280,34 @@ async def ocr_detect(serial: str | None = Query(None), device_type: str = Query(
 
         try:
             import asyncio as _asyncio
-            import numpy as _np
-            import cv2 as _cv2
-            from paddleocr import PaddleOCR
+            from rapidocr import RapidOCR
 
             loop = _asyncio.get_event_loop()
 
             def _run_ocr():
-                nparr = _np.frombuffer(img_bytes, _np.uint8)
-                img = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
-                ocr = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
-                result = ocr.ocr(img, cls=False)
+                # RapidOCR 支持 bytes / np.ndarray / 文件路径 / URL
+                ocr = RapidOCR()
+                result = ocr(img_bytes)
                 out = []
-                for line in (result or []):
-                    for item in (line or []):
-                        if not item or len(item) < 2:
-                            continue
-                        box, (text, conf) = item
-                        xs = [p[0] for p in box]
-                        ys = [p[1] for p in box]
-                        out.append({
-                            "text": text,
-                            "confidence": round(float(conf), 3),
-                            "x1": int(min(xs)), "y1": int(min(ys)),
-                            "x2": int(max(xs)), "y2": int(max(ys)),
-                        })
+                if result.boxes is None:
+                    return out
+                for box, text, score in zip(result.boxes, result.txts, result.scores):
+                    # box shape: (4, 2)，顺序：左上→右上→右下→左下
+                    xs = [p[0] for p in box]
+                    ys = [p[1] for p in box]
+                    out.append({
+                        "text": text,
+                        "confidence": round(float(score), 3),
+                        "x1": int(min(xs)), "y1": int(min(ys)),
+                        "x2": int(max(xs)), "y2": int(max(ys)),
+                    })
                 return out
 
             regions = await loop.run_in_executor(None, _run_ocr)
         except ImportError:
-            pass  # paddleocr 未安装时返回空列表
+            pass  # rapidocr / onnxruntime 未安装时返回空列表
+        except Exception as _ocr_err:
+            _log("error", None, f"OCR 识别失败: {_ocr_err}")
 
         return {
             "image": f"data:{mime};base64,{b64}",

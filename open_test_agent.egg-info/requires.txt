@@ -12,3 +12,7 @@ adbutils>=2.6
 adbutils>=2.6
 
 [harmony]
+
+[ocr]
+rapidocr>=1.0
+onnxruntime>=1.16
